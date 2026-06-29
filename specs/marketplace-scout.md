@@ -1,0 +1,144 @@
+# Marketplace Scout — Spec (v2)
+
+## Overview
+A CLI Python script invoked by Claude in-chat when the user asks to search for something. Scrapes Craigslist, OfferUp, and Facebook Marketplace, filters for quality listings, ranks by value, generates a self-contained HTML report with photos and clickable links, and auto-opens it in the browser. No notifications, no cron, no scheduling — purely on-demand.
+
+## Interaction Model
+- User says something like "find me an electric drum kit" in the Claude chat
+- Claude runs: `python3 scout.py "electric drum kit"` (optionally with `--max-price 500`)
+- Script scrapes, filters, ranks, generates HTML, opens it in the browser
+- Claude shows a brief inline summary in chat (e.g. "Found 12 listings, 4 are new — opening in browser")
+
+## CLI Interface
+```
+python3 scout.py "<query>"              # search with no budget cap
+python3 scout.py "<query>" --max-price 500   # hard budget ceiling
+python3 scout.py --login-facebook       # one-time FB cookie auth
+python3 scout.py --reset                # wipe seen-listings history
+```
+- Query is a required positional argument
+- `--max-price` is optional; if omitted, no price ceiling is applied
+- `--login-facebook` skips scraping and just does the auth flow
+- `--reset` wipes the SQLite history and exits
+
+## Scraping (Playwright for all platforms — needed for photo extraction)
+
+### Craigslist
+- URL: `https://{subdomain}.craigslist.org/search/sss?query={query}`
+- Extract per result card using updated CL layout selectors:
+  - Container: `.cl-search-result` (each listing card)
+  - ID: `data-pid` attribute on the container
+  - Title: `title` attribute on the container
+  - URL: `a.main` href inside the card
+  - Image: first `img` inside the card
+  - Price: `.priceinfo` text inside the card
+  - Description snippet: `.meta` text inside the card (used for `desc_length`)
+
+### OfferUp
+- URL: `https://offerup.com/search/?q={query}`
+- Wait for `domcontentloaded` + 3.5s
+- Extract via `a[href*="/item/"]`: title, price, image src, url
+- OfferUp listing URLs use UUID format: `/item/detail/{uuid}` — ID regex must match alphanumeric+dash, not digits only
+
+### Facebook Marketplace
+- URL: `https://www.facebook.com/marketplace/search?query={query}`
+- Requires saved cookies (`fb_cookies.json`) from `--login-facebook` flow
+- Extract via `a[href*="/marketplace/item/"]`: title, price, image src, url
+- If no cookies or session expired: skip FB gracefully, continue with other platforms
+
+### Photo extraction
+- Each scraper must extract at least one image URL per listing
+- Listings with no extractable image are marked `has_photo=False`
+
+## Quality Filter (applied before ranking)
+A listing passes if ALL of the following are true:
+1. `has_photo=True` — at least one image URL extracted
+2. `desc_length >= 30` — the description/title text is substantive (not a one-liner)
+3. `price_numeric > 0` — has a parseable numeric price
+4. `is_relevant=True` — title matches the search query (relevance check):
+   - Tokenize query into meaningful words (3+ chars, excluding stop words: "a", "an", "the", "for", "in", "at", "by", "to", "of", "and", "or", "with")
+   - For queries with 1–2 meaningful words: title must contain at least 1
+   - For queries with 3+ meaningful words: title must contain ALL of them
+   - Matching is case-insensitive substring match
+
+If `--max-price` is set: also filter out listings where `price_numeric > max_price`.
+
+Listings that fail the filter are discarded entirely — not shown.
+
+## Ranking
+1. Parse all filtered listings' prices to float
+2. Compute median price across all filtered results
+3. Sort ascending by price (cheapest qualifying listings first)
+4. Flag listings where `price < median * 0.80` as DEAL (20%+ below median)
+5. Show top 15 (or all if fewer than 15 pass the filter)
+
+## Seen-Listing Tracking (SQLite)
+- DB file: `seen_listings.db` in the project folder
+- Table: `listings(id TEXT PK, platform TEXT, title TEXT, price TEXT, url TEXT, first_seen TEXT)`
+- A listing is NEW if its ID is not in the DB
+- After generating the HTML, save all displayed listings to the DB
+- NEW listings get a "NEW" badge in the HTML; previously seen ones are visually dimmed (opacity 0.6)
+
+## HTML Report
+Generated file: `report.html` in the project folder (overwritten each run).
+
+### Layout
+- Full-page, responsive CSS grid of cards (3 columns on wide screens, 1 on narrow)
+- Page header: query string, timestamp, platform count summary
+- Each card contains:
+  - Photo (from extracted image URL, or a grey placeholder if missing)
+  - Platform badge (colored chip: CL=grey, OU=orange, FB=blue)
+  - NEW badge (green) if listing is new; card has reduced opacity if previously seen
+  - DEAL badge (red) if price is 20%+ below median
+  - Price (large, bold)
+  - Title (truncated to 2 lines)
+  - Entire card is a clickable link to the original listing (opens in new tab)
+- Footer: "Generated by Marketplace Scout · {timestamp}"
+
+### Self-contained
+- All CSS is inline in `<style>` tags — no external dependencies
+- Images load from their source URLs (hotlinked) — no downloading needed
+- Works offline for layout; images require internet
+
+## Output to Claude (stdout)
+After generating the HTML, print a one-line summary to stdout:
+```
+Found {total_scraped} listings · {passed} passed quality filter · {new_count} new · Report: {path_to_html}
+```
+Claude reads this and relays it in the chat.
+
+## File Structure
+```
+marketplace-scout/
+├── scout.py            # single script, all logic
+├── config.json         # location, platforms, craigslist subdomain
+├── report.html         # overwritten each run
+├── seen_listings.db    # auto-created
+├── fb_cookies.json     # written by --login-facebook
+└── specs/
+    └── marketplace-scout.md
+```
+
+## config.json
+```json
+{
+  "location": "San Diego, CA",
+  "craigslist_subdomain": "sandiego",
+  "platforms": ["craigslist", "offerup", "facebook"]
+}
+```
+Auto-created with defaults if missing. No query or max_price in config — those come from CLI args.
+
+## Constraints
+- Single Python file
+- No external Python libs beyond Playwright (stdlib only otherwise)
+- Playwright for all three platforms (consistent photo extraction)
+- Graceful skip of any platform that errors — always generate report from whatever succeeded
+- No notifications, no cron, no scheduling, no email/SMS
+- `requirements.txt`: `playwright>=1.40.0` only
+
+## Out of Scope
+- Price history / tracking over time
+- Email or push notifications
+- Automatic scheduled runs
+- Web UI or server
