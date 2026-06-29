@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+fb_cookies.json
+seen_listings.db
+report.html
