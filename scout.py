@@ -664,7 +664,8 @@ def is_relevant(title, query):
              if len(w) >= 3 and w not in _STOP_WORDS]
     if not words:
         return True
-    threshold = 1 if len(words) <= 2 else math.ceil(len(words) / 2)
+    # Spec: 1-2 meaningful words → at least 1 must match; 3+ → ALL must match
+    threshold = 1 if len(words) <= 2 else len(words)
     matched = sum(
         1 for qw in words
         if any(_word_match(qw, tw) for tw in title_words)
@@ -673,12 +674,14 @@ def is_relevant(title, query):
 
 
 def quality_filter(listings, query="", min_price=None, max_price=None):
-    """Keep listings with a real description, parseable price, relevance, and within budget."""
+    """Keep listings with photo, substantive description, parseable price, relevance, and within budget."""
     passed = []
     for l in listings:
-        if l["desc_length"] < 5:
+        if not l.get("has_photo"):
             continue
-        if l["price_numeric"] < 0:
+        if l["desc_length"] < 30:
+            continue
+        if l["price_numeric"] <= 0:
             continue
         if query and not is_relevant(l["title"], query):
             continue
@@ -692,8 +695,8 @@ def quality_filter(listings, query="", min_price=None, max_price=None):
 
 # ── Ranking ────────────────────────────────────────────────────────────────────
 
-def rank(listings, top_n=None):
-    """Sort by price ascending, flag deals (20%+ below median). top_n=None returns all."""
+def rank(listings, top_n=15):
+    """Sort by price ascending, flag deals (20%+ below median). top_n defaults to 15 per spec."""
     if not listings:
         return []
     prices = [l["price_numeric"] for l in listings]
@@ -815,6 +818,8 @@ def card_html(listing):
     color  = PLATFORM_COLORS.get(plat, "#6b7280")
     label  = PLATFORM_LABELS.get(plat, plat.upper())
     badges = f'<span class="badge" style="background:{color}">{label}</span>'
+    if listing.get("is_new"):
+        badges += ' <span class="badge new-badge">New</span>'
     if listing.get("is_deal"):
         badges += ' <span class="badge deal">Deal</span>'
 
@@ -822,8 +827,11 @@ def card_html(listing):
     title = h(listing["title"]) if listing["title"] else "Untitled"
     url   = h(listing["url"])
 
+    # Previously seen listings are visually dimmed per spec
+    style = ' style="opacity:0.6"' if not listing.get("is_new") else ''
+
     return (
-        f'<a href="{url}" target="_blank" rel="noopener" class="card">'
+        f'<a href="{url}" target="_blank" rel="noopener" class="card"{style}>'
         f'{photo}'
         f'<div class="body">'
         f'<div class="badges">{badges}</div>'
@@ -884,7 +892,7 @@ def main():
     parser.add_argument("queries",          nargs="*", help="One or more things to search for — multiple queries are merged into one report")
     parser.add_argument("--min-price",      type=float, help="Hard price floor (optional)")
     parser.add_argument("--max-price",      type=float, help="Hard price ceiling (optional)")
-    parser.add_argument("--limit",          type=int,   default=None, help="Max results to show (default: all that pass quality filter)")
+    parser.add_argument("--limit",          type=int,   default=15,   help="Max results to show (default: 15)")
     parser.add_argument("--platforms",      nargs="+", metavar="PLATFORM", help="Override platforms for this run (e.g. --platforms mercari depop poshmark)")
     parser.add_argument("--login-facebook", action="store_true", help="One-time Facebook login flow")
     parser.add_argument("--reset",          action="store_true", help="Wipe seen-listings history and exit")
@@ -984,10 +992,19 @@ def main():
 
     total_scraped = len(all_listings)
 
+    # ── Seen-listing DB ───────────────────────────────────────────────────────
+    conn = init_db()
+
     # ── Filter & rank ────────────────────────────────────────────────────────
     active_query = queries[0] if len(queries) == 1 else ""
     filtered = quality_filter(all_listings, query=active_query, min_price=args.min_price, max_price=args.max_price)
-    ranked   = rank(filtered, top_n=limit)
+
+    # Mark each listing as new or previously seen
+    for l in filtered:
+        l["is_new"] = is_new(conn, l["id"])
+
+    ranked    = rank(filtered, top_n=limit)
+    new_count = sum(1 for l in ranked if l.get("is_new"))
 
     # ── Generate HTML ────────────────────────────────────────────────────────
     timestamp     = datetime.now().strftime("%b %d %Y  %H:%M")
@@ -995,13 +1012,18 @@ def main():
     html_content  = generate_html(display_query, ranked, platform_counts, timestamp, fb_skip=fb_skip_reason)
     HTML_PATH.write_text(html_content, encoding="utf-8")
 
+    # ── Save displayed listings to DB ────────────────────────────────────────
+    for l in ranked:
+        save_listing(conn, l)
+    conn.close()
+
     # ── Open in browser ──────────────────────────────────────────────────────
     subprocess.run(["open", str(HTML_PATH)], check=False)
 
     # ── Summary line to stdout (Claude reads this) ───────────────────────────
     print(
         f"Found {total_scraped} listings · {len(filtered)} passed quality filter "
-        f"· Report: {HTML_PATH}"
+        f"· {new_count} new · Report: {HTML_PATH}"
     )
 
 
