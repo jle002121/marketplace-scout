@@ -4,3 +4,4 @@ __pycache__/
 fb_cookies.json
 seen_listings.db
 report.html
+config.json

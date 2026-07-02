@@ -1,0 +1,14 @@
+{
+  "location": "Your City, ST",
+  "craigslist_subdomain": "yourcity",
+  "platforms": ["craigslist", "offerup", "facebook"],
+  "_available_platforms": "craigslist, offerup, facebook, mercari, depop, poshmark  (ebay blocks bots — not supported)",
+  "_clothes_platforms": ["craigslist", "offerup", "facebook", "depop", "poshmark", "mercari"],
+  "presets": {
+    "example1": "search term one",
+    "example2": "search term two"
+  },
+  "groups": {
+    "mygroup": ["example1", "example2"]
+  }
+}
