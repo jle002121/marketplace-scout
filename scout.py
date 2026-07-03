@@ -731,14 +731,12 @@ header h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 6px; }
 header p  { font-size: 0.9rem; color: #9ca3af; }
 .grid {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 16px;
     padding: 24px 32px;
-    max-width: 1800px;
+    max-width: 1200px;
     margin: 0 auto;
 }
-@media (max-width: 1400px) { .grid { grid-template-columns: repeat(4, 1fr); } }
-@media (max-width: 1050px) { .grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 700px)  { .grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 440px)  { .grid { grid-template-columns: 1fr; } }
 .card {
