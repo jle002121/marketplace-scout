@@ -1,6 +1,9 @@
 {
   "location": "Your City, ST",
   "craigslist_subdomain": "yourcity",
+  "craigslist_postal": "00000",
+  "craigslist_search_distance": 40,
+  "facebook_city": "yourcity",
   "platforms": ["craigslist", "offerup", "facebook"],
   "_available_platforms": "craigslist, offerup, facebook, mercari, depop, poshmark  (ebay blocks bots — not supported)",
   "_clothes_platforms": ["craigslist", "offerup", "facebook", "depop", "poshmark", "mercari"],

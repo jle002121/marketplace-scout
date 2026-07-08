@@ -33,6 +33,9 @@ HTML_PATH = BASE_DIR / "report.html"
 DEFAULT_CONFIG = {
     "location": "San Diego, CA",
     "craigslist_subdomain": "sandiego",
+    "craigslist_postal": "92123",
+    "craigslist_search_distance": 40,
+    "facebook_city": "sandiego",
     "platforms": ["craigslist", "offerup", "facebook"],
 }
 
@@ -102,11 +105,14 @@ async def scrape_craigslist(query, config, context):
     """Async Playwright scrape of Craigslist search results page."""
     listings = []
     subdomain = config.get("craigslist_subdomain", "sandiego")
+    postal    = config.get("craigslist_postal", "92123")
+    distance  = config.get("craigslist_search_distance", 40)
     q = query.replace(" ", "+")
     page = await context.new_page()
     try:
         await page.goto(
-            f"https://{subdomain}.craigslist.org/search/sss?query={q}",
+            f"https://{subdomain}.craigslist.org/search/sss?query={q}"
+            f"&postal={postal}&search_distance={distance}",
             wait_until="domcontentloaded", timeout=30000
         )
         await page.wait_for_timeout(2000)
@@ -132,9 +138,16 @@ async def scrape_craigslist(query, config, context):
         except Exception:
             await page.wait_for_timeout(3000)
 
-        rows = await page.eval_on_selector_all(
-            ".cl-search-result",
-            """cards => cards.map(el => {
+        # Craigslist appends "more from nearby areas" results after a
+        # .nearby-separator element — those are outside San Diego, so only
+        # keep cards that appear before the separator in the DOM.
+        rows = await page.evaluate(
+            """() => {
+                const sep = document.querySelector('.nearby-separator');
+                const cards = Array.from(document.querySelectorAll('.cl-search-result'))
+                    .filter(el => !sep ||
+                        (sep.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING));
+                return cards.map(el => {
                 const linkEl  = el.querySelector('a.main');
                 const imgEl   = el.querySelector('img');
                 const priceEl = el.querySelector('.priceinfo');
@@ -151,7 +164,8 @@ async def scrape_craigslist(query, config, context):
                     price: priceEl ? priceEl.innerText.trim() : '',
                     meta:  metaEl  ? metaEl.innerText.trim()  : '',
                 };
-            })"""
+                });
+            }"""
         )
 
         for r in rows:
@@ -251,8 +265,9 @@ async def scrape_facebook(query, config, context):
     try:
         await context.add_cookies(json.loads(COOK_PATH.read_text()))
         q = query.replace(" ", "%20")
+        city = config.get("facebook_city", "sandiego")
         await page.goto(
-            f"https://www.facebook.com/marketplace/search?query={q}",
+            f"https://www.facebook.com/marketplace/{city}/search?query={q}",
             wait_until="domcontentloaded", timeout=30000
         )
         await page.wait_for_timeout(4000)
@@ -550,7 +565,12 @@ async def _scrape_query_async(query, config, browser):
     Returns (listings, fb_skip_reason).
     """
     from playwright.async_api import async_playwright  # noqa — imported for type only
-    context = await browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 900})
+    context = await browser.new_context(
+        user_agent=UA,
+        viewport={"width": 1280, "height": 900},
+        geolocation={"latitude": 32.7157, "longitude": -117.1611},  # San Diego
+        permissions=["geolocation"],
+    )
     listings = []
     fb_skip = None
     platforms = config.get("platforms", ["craigslist", "offerup", "facebook"])
@@ -583,6 +603,10 @@ async def _scrape_query_async(query, config, browser):
                 if isinstance(r, tuple):
                     fb_listings, fb_skip = r
                     listings.extend(fb_listings)
+        # Tag each listing with the query that found it, so multi-query runs
+        # can still relevance-check every listing against its own query.
+        for l in listings:
+            l["query"] = query
     finally:
         await context.close()
     return listings, fb_skip
@@ -674,7 +698,11 @@ def is_relevant(title, query):
 
 
 def quality_filter(listings, query="", min_price=None, max_price=None):
-    """Keep listings with photo, substantive description, parseable price, relevance, and within budget."""
+    """Keep listings with photo, substantive description, parseable price, relevance, and within budget.
+
+    Relevance is checked against the listing's own source query (set by the scraper)
+    when available, falling back to the `query` argument.
+    """
     passed = []
     for l in listings:
         if not l.get("has_photo"):
@@ -683,7 +711,8 @@ def quality_filter(listings, query="", min_price=None, max_price=None):
             continue
         if l["price_numeric"] <= 0:
             continue
-        if query and not is_relevant(l["title"], query):
+        q = l.get("query") or query
+        if q and not is_relevant(l["title"], q):
             continue
         if min_price is not None and l["price_numeric"] < min_price:
             continue
@@ -825,11 +854,8 @@ def card_html(listing):
     title = h(listing["title"]) if listing["title"] else "Untitled"
     url   = h(listing["url"])
 
-    # Previously seen listings are visually dimmed per spec
-    style = ' style="opacity:0.6"' if not listing.get("is_new") else ''
-
     return (
-        f'<a href="{url}" target="_blank" rel="noopener" class="card"{style}>'
+        f'<a href="{url}" target="_blank" rel="noopener" class="card">'
         f'{photo}'
         f'<div class="body">'
         f'<div class="badges">{badges}</div>'
@@ -890,7 +916,7 @@ def main():
     parser.add_argument("queries",          nargs="*", help="One or more things to search for — multiple queries are merged into one report")
     parser.add_argument("--min-price",      type=float, help="Hard price floor (optional)")
     parser.add_argument("--max-price",      type=float, help="Hard price ceiling (optional)")
-    parser.add_argument("--limit",          type=int,   default=15,   help="Max results to show (default: 15)")
+    parser.add_argument("--limit",          type=int,   default=0,    help="Max results to show (default: 0 = show all)")
     parser.add_argument("--platforms",      nargs="+", metavar="PLATFORM", help="Override platforms for this run (e.g. --platforms mercari depop poshmark)")
     parser.add_argument("--login-facebook", action="store_true", help="One-time Facebook login flow")
     parser.add_argument("--reset",          action="store_true", help="Wipe seen-listings history and exit")
@@ -910,6 +936,12 @@ def main():
     # --platforms flag overrides config for this run only
     if args.platforms:
         config["platforms"] = args.platforms
+
+    supported = {"craigslist", "offerup", "facebook", "mercari", "depop", "poshmark"}
+    unknown = [p for p in config.get("platforms", []) if p not in supported]
+    if unknown:
+        note = " (ebay blocks headless browsers — not supported)" if "ebay" in unknown else ""
+        print(f"  Note: unsupported platform(s) ignored: {', '.join(unknown)}{note}", file=sys.stderr)
 
     # ── List presets ────────────────────────────────────────────────────────────
     if args.list_presets:
@@ -967,7 +999,7 @@ def main():
             used_preset = True
         queries.extend(expanded)
 
-    limit = args.limit  # None = no cap (show all that pass quality filter)
+    limit = args.limit if args.limit and args.limit > 0 else None  # None/0 = no cap
 
     # ── Scrape (async parallel — all queries simultaneously) ─────────────────
     print(f"  Searching {len(queries)} quer{'y' if len(queries)==1 else 'ies'} in parallel...",
@@ -994,8 +1026,9 @@ def main():
     conn = init_db()
 
     # ── Filter & rank ────────────────────────────────────────────────────────
-    active_query = queries[0] if len(queries) == 1 else ""
-    filtered = quality_filter(all_listings, query=active_query, min_price=args.min_price, max_price=args.max_price)
+    # Each listing carries its own source query, so relevance works per-query
+    # even when multiple queries are merged into one report.
+    filtered = quality_filter(all_listings, min_price=args.min_price, max_price=args.max_price)
 
     # Mark each listing as new or previously seen
     for l in filtered:
@@ -1021,7 +1054,7 @@ def main():
     # ── Summary line to stdout (Claude reads this) ───────────────────────────
     print(
         f"Found {total_scraped} listings · {len(filtered)} passed quality filter "
-        f"· {new_count} new · Report: {HTML_PATH}"
+        f"· {len(ranked)} shown ({new_count} new) · Report: {HTML_PATH}"
     )
 
 
