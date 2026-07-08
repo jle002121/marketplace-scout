@@ -12,6 +12,10 @@
     "example2": "search term two"
   },
   "groups": {
-    "mygroup": ["example1", "example2"]
+    "mygroup": ["example1", "example2"],
+    "mygroup-with-platforms": {
+      "presets": ["example1", "example2"],
+      "platforms": ["craigslist", "offerup", "facebook", "mercari", "depop", "poshmark"]
+    }
   }
 }

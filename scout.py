@@ -950,8 +950,14 @@ def main():
             print(f"  {name:<16} → \"{query}\"")
         if groups:
             print("\nGroups (run multiple presets at once):")
-            for name, members in groups.items():
-                print(f"  {name:<16} → {', '.join(members)}")
+            for name, group in groups.items():
+                if isinstance(group, dict):
+                    members = ", ".join(group.get("presets", []))
+                    plats = group.get("platforms")
+                    suffix = f"  [platforms: {', '.join(plats)}]" if plats else ""
+                    print(f"  {name:<16} → {members}{suffix}")
+                else:
+                    print(f"  {name:<16} → {', '.join(group)}")
         print()
         return
 
@@ -986,7 +992,13 @@ def main():
     def expand(q):
         key = q.lower().replace(" ", "")
         if key in groups:
-            return [presets[m] for m in groups[key] if m in presets]
+            group = groups[key]
+            # Groups are either a plain list of preset names, or an object
+            # {"presets": [...], "platforms": [...]} carrying its own platforms.
+            members = group["presets"] if isinstance(group, dict) else group
+            if isinstance(group, dict) and group.get("platforms") and not args.platforms:
+                config["platforms"] = group["platforms"]
+            return [presets[m] for m in members if m in presets]
         if key in presets:
             return [presets[key]]
         return [q]
