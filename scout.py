@@ -614,16 +614,34 @@ async def _scrape_query_async(query, config, browser):
 
 async def scrape_all_async(queries, config):
     """Launch one async task per query and gather all results in parallel.
+    At most max_parallel_queries queries are in flight at once — big runs
+    (e.g. 27 queries × 6 platforms) otherwise open so many pages that the
+    heavier sites all hit their 30s goto timeouts.
     Returns (all_listings, fb_skip_reason).
     """
+    max_parallel = config.get("max_parallel_queries")
+    if not isinstance(max_parallel, int) or max_parallel <= 0:
+        max_parallel = 4
+    sem = asyncio.Semaphore(max_parallel)
+    done_count = 0
+
     from playwright.async_api import async_playwright
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"]
         )
+
+        async def scrape_limited(q):
+            nonlocal done_count
+            async with sem:
+                result = await _scrape_query_async(q, config, browser)
+            done_count += 1
+            print(f'  [{done_count}/{len(queries)}] done: "{q}"', file=sys.stderr)
+            return result
+
         try:
-            tasks = [_scrape_query_async(q, config, browser) for q in queries]
+            tasks = [scrape_limited(q) for q in queries]
             results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await browser.close()
@@ -652,6 +670,43 @@ def do_facebook_login(pw):
     COOK_PATH.write_text(json.dumps(context.cookies()))
     print(f"  Cookies saved → {COOK_PATH}\n")
     browser.close()
+
+
+# ── Shoe Size Filter ───────────────────────────────────────────────────────────
+
+_SIZE_DECL_RE = re.compile(
+    r"\b(?:size|sz\.?|us|u\.s\.|men['’]?s|wo?men['’]?s?|wmns)\s*:?\s*"
+    r"(?:(\d{1,2})\s*1/2|(\d{1,2}(?:\.5)?)(?!\d))", re.I)
+_WOMENS_RE = re.compile(
+    r"\b(?:wo?men['’]?s?|wmns|girls?|kids?|youth|toddler)\b", re.I)
+_FOOTWEAR_RE = re.compile(
+    r"\b(?:boots?|shoes?|sneakers?|sandals?|chelsea|oxfords?|running|runners?|trainers?)\b", re.I)
+
+
+def size_filter(listings, allowed_sizes):
+    """Drop footwear listings whose title declares a shoe size outside allowed_sizes.
+
+    Declared values > 16 are waist/garment sizes, never shoe sizes. Titles with
+    no size declaration pass through. Women's/kids items are dropped only when
+    the title also looks like footwear (shoe word or declared shoe-range size).
+    Returns (kept_listings, dropped_count); disabled when allowed_sizes is empty.
+    """
+    if not allowed_sizes:
+        return listings, 0
+    allowed = {float(s) for s in allowed_sizes}
+    kept, dropped = [], 0
+    for l in listings:
+        title = l.get("title", "")
+        declared = (float(frac) + 0.5 if frac else float(whole)
+                    for frac, whole in _SIZE_DECL_RE.findall(title))
+        shoe_sizes = [v for v in declared if v <= 16]
+        bad_size = bool(shoe_sizes) and not any(v in allowed for v in shoe_sizes)
+        womens = _WOMENS_RE.search(title) and (_FOOTWEAR_RE.search(title) or shoe_sizes)
+        if bad_size or womens:
+            dropped += 1
+        else:
+            kept.append(l)
+    return kept, dropped
 
 
 # ── Quality Filter ─────────────────────────────────────────────────────────────
@@ -921,6 +976,7 @@ def main():
     parser.add_argument("--login-facebook", action="store_true", help="One-time Facebook login flow")
     parser.add_argument("--reset",          action="store_true", help="Wipe seen-listings history and exit")
     parser.add_argument("--list-presets",   action="store_true", help="List all saved searches and groups, then exit")
+    parser.add_argument("--no-sync",        action="store_true", help="Skip auto-sync for groups that carry a sync script")
     args = parser.parse_args()
 
     # ── Config ─────────────────────────────────────────────────────────────────
@@ -988,6 +1044,25 @@ def main():
     if not args.queries:
         parser.error("at least one query is required (e.g. scout \"surfboard\" or scout surf)")
 
+    # ── Auto-sync groups that carry a "sync" script ───────────────────────────
+    if not args.no_sync:
+        for raw in args.queries:
+            group = groups.get(raw.lower().replace(" ", ""))
+            if isinstance(group, dict) and group.get("sync"):
+                script = BASE_DIR / group["sync"]
+                print(f"  Syncing presets from wardrobe note ({script.name})...", file=sys.stderr)
+                try:
+                    subprocess.run([sys.executable, str(script)], cwd=BASE_DIR, check=True)
+                except (subprocess.SubprocessError, OSError) as e:
+                    print(f"  Warning: sync failed ({e}) — using existing presets", file=sys.stderr)
+                else:
+                    config  = json.loads(CFG_PATH.read_text())
+                    presets = config.get("presets", {})
+                    groups  = config.get("groups",  {})
+                    if args.platforms:
+                        config["platforms"] = args.platforms
+                break
+
     # ── Expand presets and groups ────────────────────────────────────────────
     def expand(q):
         key = q.lower().replace(" ", "")
@@ -1041,6 +1116,11 @@ def main():
     # Each listing carries its own source query, so relevance works per-query
     # even when multiple queries are merged into one report.
     filtered = quality_filter(all_listings, min_price=args.min_price, max_price=args.max_price)
+
+    # Drop footwear in the wrong size (my_shoe_sizes in config.json)
+    filtered, size_dropped = size_filter(filtered, config.get("my_shoe_sizes"))
+    if size_dropped:
+        print(f"  {size_dropped} listings dropped by shoe-size filter (my_shoe_sizes)", file=sys.stderr)
 
     # Mark each listing as new or previously seen
     for l in filtered:

@@ -4,18 +4,48 @@
   "craigslist_postal": "00000",
   "craigslist_search_distance": 40,
   "facebook_city": "yourcity",
-  "platforms": ["craigslist", "offerup", "facebook"],
-  "_available_platforms": "craigslist, offerup, facebook, mercari, depop, poshmark  (ebay blocks bots — not supported)",
-  "_clothes_platforms": ["craigslist", "offerup", "facebook", "depop", "poshmark", "mercari"],
+  "platforms": [
+    "craigslist",
+    "offerup",
+    "facebook"
+  ],
+  "max_parallel_queries": 4,
+  "my_shoe_sizes": [
+    "10",
+    "10.5",
+    "11"
+  ],
+  "_available_platforms": "craigslist, offerup, facebook, mercari, depop, poshmark  (ebay blocks bots \u2014 not supported)",
+  "_clothes_platforms": [
+    "craigslist",
+    "offerup",
+    "facebook",
+    "depop",
+    "poshmark",
+    "mercari"
+  ],
   "presets": {
     "example1": "search term one",
     "example2": "search term two"
   },
   "groups": {
-    "mygroup": ["example1", "example2"],
+    "mygroup": [
+      "example1",
+      "example2"
+    ],
     "mygroup-with-platforms": {
-      "presets": ["example1", "example2"],
-      "platforms": ["craigslist", "offerup", "facebook", "mercari", "depop", "poshmark"]
+      "presets": [
+        "example1",
+        "example2"
+      ],
+      "platforms": [
+        "craigslist",
+        "offerup",
+        "facebook",
+        "mercari",
+        "depop",
+        "poshmark"
+      ]
     }
   }
 }
