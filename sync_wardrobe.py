@@ -45,8 +45,9 @@ def parse_note(md, skip_sections):
             continue
         if lines[i].lstrip().startswith("|"):
             header = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-            if "Brand" in header and "Model" in header:
-                bi, mi = header.index("Brand"), header.index("Model")
+            model_col = next((c for c in ("Model", "What to look for") if c in header), None)
+            if "Brand" in header and model_col:
+                bi, mi = header.index("Brand"), header.index(model_col)
                 skip = any(s.lower() in heading.lower() for s in skip_sections)
                 i += 2  # skip header + separator row
                 while i < len(lines) and lines[i].lstrip().startswith("|"):
