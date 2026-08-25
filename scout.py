@@ -22,7 +22,10 @@ import statistics
 import subprocess
 import sys
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+from urllib.request import Request, urlopen
 
 BASE_DIR  = Path(__file__).parent
 DB_PATH   = BASE_DIR / "seen_listings.db"
@@ -100,6 +103,239 @@ def make_id(platform, url):
 
 
 # ── Scrapers ───────────────────────────────────────────────────────────────────
+
+class _CraigslistStaticParser(HTMLParser):
+    """Parse Craigslist's no-JavaScript result cards and JSON-LD payloads."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.json_ld = []
+        self._row = None
+        self._field = None
+        self._script = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set(attrs.get("class", "").split())
+        if tag == "li" and "cl-static-search-result" in classes:
+            self._row = {"title": attrs.get("title", ""), "url": "", "price": "", "meta": ""}
+        elif self._row is not None and tag == "a" and not self._row["url"]:
+            self._row["url"] = attrs.get("href", "")
+        elif self._row is not None and tag == "div":
+            if "price" in classes:
+                self._field = "price"
+            elif "location" in classes:
+                self._field = "meta"
+        elif tag == "script" and attrs.get("type") == "application/ld+json":
+            self._script = []
+
+    def handle_data(self, data):
+        if self._script is not None:
+            self._script.append(data)
+        if self._row is not None and self._field:
+            self._row[self._field] += data
+
+    def handle_endtag(self, tag):
+        if tag == "div":
+            self._field = None
+        elif tag == "li" and self._row is not None:
+            self._row["price"] = self._row["price"].strip()
+            self._row["meta"] = " ".join(self._row["meta"].split())
+            self.rows.append(self._row)
+            self._row = None
+            self._field = None
+        elif tag == "script" and self._script is not None:
+            self.json_ld.append("".join(self._script))
+            self._script = None
+
+
+def parse_craigslist_static_html(document):
+    """Convert Craigslist's static response into normal Scout listings."""
+    parser = _CraigslistStaticParser()
+    parser.feed(document)
+
+    products = []
+    for payload in parser.json_ld:
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if data.get("@type") == "ItemList":
+            products = [entry.get("item", {}) for entry in data.get("itemListElement", [])]
+            break
+
+    listings = []
+    for index, row in enumerate(parser.rows):
+        if not row["url"]:
+            continue
+        product = products[index] if index < len(products) else {}
+        images = product.get("image") or []
+        if isinstance(images, str):
+            images = [images]
+        img_url = images[0] if images else ""
+        title = row["title"] or product.get("name", "")
+        price = row["price"]
+        if not price and product.get("offers", {}).get("price"):
+            price = f'${float(product["offers"]["price"]):,.0f}'
+        slug = urlparse(row["url"]).path.rstrip("/").rsplit("/", 1)[-1]
+        listings.append({
+            "id": f"cl_{slug}",
+            "platform": "craigslist",
+            "title": title,
+            "price": price,
+            "price_numeric": parse_price(price),
+            "url": row["url"],
+            "img": img_url,
+            "has_photo": bool(img_url.startswith("http")),
+            "desc_length": len(f'{title} {row["meta"]}'.strip()),
+        })
+    return listings
+
+
+class _JsonScriptParser(HTMLParser):
+    """Extract the contents of a script selected by one HTML attribute."""
+
+    def __init__(self, attribute, value):
+        super().__init__()
+        self.attribute = attribute
+        self.value = value
+        self.parts = []
+        self._capture = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script" and dict(attrs).get(self.attribute) == self.value:
+            self._capture = True
+
+    def handle_data(self, data):
+        if self._capture:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._capture = False
+
+
+def _fetch_text(url, cookie_header=None):
+    headers = {"User-Agent": UA}
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=30) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _fetch_craigslist_static(query, config):
+    subdomain = config.get("craigslist_subdomain", "sandiego")
+    postal = config.get("craigslist_postal", "92123")
+    distance = config.get("craigslist_search_distance", 40)
+    url = (
+        f"https://{subdomain}.craigslist.org/search/sss?query={quote_plus(query)}"
+        f"&postal={postal}&search_distance={distance}"
+    )
+    return parse_craigslist_static_html(_fetch_text(url))
+
+
+async def scrape_craigslist_http(query, config):
+    """Browser-free Craigslist fallback for environments that reject Chromium."""
+    try:
+        return await asyncio.to_thread(_fetch_craigslist_static, query, config)
+    except Exception as e:
+        print(f"  [CL:{query}] Direct fallback error: {e}", file=sys.stderr)
+        return []
+
+
+def parse_offerup_static_html(document):
+    """Parse OfferUp's server-rendered Next.js search payload."""
+    parser = _JsonScriptParser("id", "__NEXT_DATA__")
+    parser.feed(document)
+    if not parser.parts:
+        return []
+    data = json.loads("".join(parser.parts))
+    tiles = data.get("props", {}).get("pageProps", {}).get("searchFeedResponse", {}).get("looseTiles", [])
+    listings = []
+    for tile in tiles:
+        item = tile.get("listing") or {}
+        listing_id = item.get("listingId")
+        if not listing_id:
+            continue
+        title = (item.get("title") or "").strip()
+        price_value = item.get("price")
+        price = f"${float(price_value):,.0f}" if price_value not in (None, "") else ""
+        image = (item.get("image") or {}).get("url", "")
+        location = item.get("locationName") or ""
+        listings.append({
+            "id": f"ou_{listing_id}",
+            "platform": "offerup",
+            "title": title,
+            "price": price,
+            "price_numeric": parse_price(price),
+            "url": f"https://offerup.com/item/detail/{listing_id}",
+            "img": image,
+            "has_photo": bool(image.startswith("http")),
+            "desc_length": len(f"{title} {location}".strip()),
+        })
+    return listings
+
+
+def _fetch_offerup_static(query, config):
+    url = f"https://offerup.com/search/?q={quote_plus(query)}"
+    return parse_offerup_static_html(_fetch_text(url))
+
+
+async def scrape_offerup_http(query, config):
+    try:
+        return await asyncio.to_thread(_fetch_offerup_static, query, config)
+    except Exception as e:
+        print(f"  [OU:{query}] Direct fallback error: {e}", file=sys.stderr)
+        return []
+
+
+def parse_poshmark_static_html(document):
+    """Parse Poshmark's server-rendered initial search state."""
+    marker = "window.__INITIAL_STATE__="
+    if marker not in document:
+        return []
+    payload = document.split(marker, 1)[1].split(";(function()", 1)[0]
+    data = json.loads(payload)
+    items = data.get("$_search", {}).get("gridData", {}).get("data", [])
+    listings = []
+    for item in items:
+        listing_id = item.get("id")
+        title = (item.get("title") or "").strip()
+        if not listing_id or not title:
+            continue
+        amount = (item.get("price_amount") or {}).get("val", item.get("price"))
+        price = f"${float(amount):,.0f}" if amount not in (None, "") else ""
+        image = item.get("picture_url") or (item.get("cover_shot") or {}).get("url", "")
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-")
+        description = item.get("description") or ""
+        listings.append({
+            "id": f"pm_{listing_id}",
+            "platform": "poshmark",
+            "title": title,
+            "price": price,
+            "price_numeric": parse_price(price),
+            "url": f"https://poshmark.com/listing/{slug}-{listing_id}",
+            "img": image,
+            "has_photo": bool(image.startswith("http")),
+            "desc_length": len(f"{title} {description}".strip()),
+        })
+    return listings
+
+
+def _fetch_poshmark_static(query, config):
+    url = f"https://poshmark.com/search?query={quote_plus(query)}&type=listings&src=dir"
+    return parse_poshmark_static_html(_fetch_text(url))
+
+
+async def scrape_poshmark_http(query, config):
+    try:
+        return await asyncio.to_thread(_fetch_poshmark_static, query, config)
+    except Exception as e:
+        print(f"  [PM:{query}] Direct fallback error: {e}", file=sys.stderr)
+        return []
+
 
 async def scrape_craigslist(query, config, context):
     """Async Playwright scrape of Craigslist search results page."""
@@ -400,6 +636,16 @@ async def scrape_mercari(query, config, context):
             }))"""
         )
 
+        if not items:
+            body_text = (await page.locator("body").inner_text()).lower()
+            challenge = any(marker in body_text for marker in (
+                "just a moment", "verify you are human", "access denied", "captcha"
+            ))
+            print(
+                f"  [MC:{query}] No listings returned (challenge={challenge}); continuing.",
+                file=sys.stderr,
+            )
+
         seen = set()
         for el in items:
             href = el.get("href", "")
@@ -452,15 +698,34 @@ async def scrape_depop(query, config, context):
                 img:   e.querySelector('img')?.src || '',
                 alt:   e.querySelector('img')?.alt || '',
                 price: e.querySelector('[class*="price"]')?.innerText?.trim() || '',
+                cardText: e.closest('li')?.innerText?.trim()
+                          || e.parentElement?.parentElement?.innerText?.trim()
+                          || e.innerText.trim(),
             }))"""
         )
+
+        if not items:
+            anchor_count = await page.locator("a").count()
+            body_text = (await page.locator("body").inner_text()).lower()
+            challenge = any(marker in body_text for marker in (
+                "forbidden", "verify you are human", "access denied", "captcha"
+            ))
+            print(
+                f"  [DP:{query}] 0 product links; final_url={page.url} "
+                f"title={await page.title()!r} anchors={anchor_count} challenge={challenge}",
+                file=sys.stderr,
+            )
 
         seen = set()
         for el in items:
             href = el.get("href", "")
             img  = el.get("img", "")
             alt  = el.get("alt", "")
+            card_text = el.get("cardText", "")
             price = el.get("price", "")
+            if not price:
+                price_match = re.search(r"\$\s*\d[\d,.]*", card_text)
+                price = price_match.group(0) if price_match else ""
             m = re.search(r'/products/([^/?]+)', href)
             if not m:
                 continue
@@ -470,10 +735,12 @@ async def scrape_depop(query, config, context):
             seen.add(lid)
             if not href.startswith("http"):
                 href = "https://www.depop.com" + href
-            # Derive title from URL slug (e.g. "vintage-90s-levis-jeans" → "vintage 90s levis jeans")
+            # Keep the complete product slug: its first component is not always
+            # a seller name, and stripping it removed brands such as "red" from
+            # "red-wing-iron-ranger".
             slug = m.group(1)
-            slug_parts = re.sub(r'^[a-z0-9]+-', '', slug)  # strip seller prefix
-            title = alt or slug_parts.replace("-", " ").title()
+            slug_title = slug.replace("-", " ").title()
+            title = alt if alt and is_relevant(alt, query) else slug_title
             listings.append({
                 "id":            lid,
                 "platform":      "depop",
@@ -483,7 +750,7 @@ async def scrape_depop(query, config, context):
                 "url":           href,
                 "img":           img,
                 "has_photo":     bool(img and img.startswith("http")),
-                "desc_length":   len(title) + len(price),
+                "desc_length":   max(len(card_text), len(title) + len(price)),
             })
     except Exception as e:
         print(f"  [DP:{query}] Error: {e}", file=sys.stderr)
@@ -627,10 +894,48 @@ async def scrape_all_async(queries, config):
 
     from playwright.async_api import async_playwright
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
+        try:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+        except Exception as e:
+            print(f"  Browser launch failed ({type(e).__name__}); using direct web fallbacks.",
+                  file=sys.stderr)
+            platforms = config.get("platforms", [])
+
+            async def scrape_direct_limited(query):
+                nonlocal done_count
+                async with sem:
+                    tasks = []
+                    if "craigslist" in platforms:
+                        tasks.append(scrape_craigslist_http(query, config))
+                    if "offerup" in platforms:
+                        tasks.append(scrape_offerup_http(query, config))
+                    if "poshmark" in platforms:
+                        tasks.append(scrape_poshmark_http(query, config))
+                    rows = []
+                    if tasks:
+                        for source_rows in await asyncio.gather(*tasks):
+                            rows.extend(source_rows)
+                done_count += 1
+                print(f'  [{done_count}/{len(queries)}] done: "{query}"', file=sys.stderr)
+                return rows
+
+            results = await asyncio.gather(*(scrape_direct_limited(query) for query in queries))
+            listings = []
+            for query, rows in zip(queries, results):
+                for listing in rows:
+                    listing["query"] = query
+                listings.extend(rows)
+            unavailable = [
+                name for name in ("facebook", "mercari", "depop")
+                if name in platforms
+            ]
+            note = "browser unavailable"
+            if unavailable:
+                note += f"; skipped browser-only sources: {', '.join(unavailable)}"
+            return listings, note
 
         async def scrape_limited(q):
             nonlocal done_count
@@ -936,7 +1241,7 @@ def generate_html(query, listings, platform_counts, timestamp, fb_skip=None):
     if fb_skip:
         fb_banner = (
             f'<div class="fb-warning">'
-            f'<strong>Facebook Marketplace skipped:</strong> {h(fb_skip)}'
+            f'<strong>Source note:</strong> {h(fb_skip)}'
             f'</div>'
         )
 
@@ -960,6 +1265,33 @@ def generate_html(query, listings, platform_counts, timestamp, fb_skip=None):
   <footer>Generated by Marketplace Scout &middot; {ts}</footer>
 </body>
 </html>"""
+
+
+def open_report(path):
+    """Open the generated report in Safari, even if Launch Services is unavailable."""
+    quiet = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "check": False,
+    }
+    result = subprocess.run(["open", "-a", "Safari", str(path)], **quiet)
+    if result.returncode == 0:
+        return True
+
+    # Codex and other non-GUI shells can lack a Launch Services connection even
+    # while Safari itself is installed. Starting Safari's executable directly
+    # still opens the report in the user's existing Safari session.
+    safari = Path("/Applications/Safari.app/Contents/MacOS/Safari")
+    if safari.exists():
+        result = subprocess.run([str(safari), path.resolve().as_uri()], **quiet)
+        if result.returncode == 0:
+            return True
+
+    print(
+        f"  Report created but could not be opened in Safari; open it here: {path}",
+        file=sys.stderr,
+    )
+    return False
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1141,7 +1473,7 @@ def main():
     conn.close()
 
     # ── Open in browser ──────────────────────────────────────────────────────
-    subprocess.run(["open", str(HTML_PATH)], check=False)
+    open_report(HTML_PATH)
 
     # ── Summary line to stdout (Claude reads this) ───────────────────────────
     print(
